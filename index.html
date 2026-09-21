@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no" />
+  <title>GS-Visualizer V2.2.1 — Turing Audio Reservoir</title>
+  <link rel="manifest" href="./manifest.json">
+  <link rel="icon" href="./icon-192.png" type="image/png">
+  <meta name="theme-color" content="#000000">
+  <style>
+    html, body { height: 100%; }
+    body { margin: 0; background: #000; color: #fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+           display: flex; flex-direction: column; align-items: center; padding: 16px; }
+    canvas { background: #000; width: 100%; max-width: 520px; aspect-ratio: 1 / 1;
+             border-radius: 8px; opacity: 0; transition: opacity .8s ease; pointer-events: none; }
+    canvas.active { opacity: 1; pointer-events: auto; }
+    #controls { display: flex; flex-direction: column; align-items: stretch; width: 100%;
+                max-width: 520px; margin-top: 16px; gap: 8px; }
+    #lcd, button, label { height: 48px; background: #111; border: 1px solid #444; color: #fff;
+                          font-size: 16px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                          display: flex; align-items: center; justify-content: center; white-space: nowrap;
+                          cursor: pointer; padding: 0 12px; border-radius: 10px; overflow: hidden; text-overflow: ellipsis; }
+    #lcd small { opacity: .7; margin-left: 8px; font-size: 12px; }
+    #lcd span { display: inline-block; animation: scroll 12s linear infinite; }
+    @keyframes scroll { from { transform: translateX(100%); } to { transform: translateX(-100%); } }
+    input[type="file"] { display: none; }
+    audio { display: none; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="controls">
+    <div id="lcd"><span>NO FILES LOADED</span></div>
+    <label id="folderButton">SELECT MUSIC FOLDER / FILES</label>
+    <button id="playButton">PLAY</button>
+    <button id="pauseButton">PAUSE</button>
+    <button id="skipButton">NEXT</button>
+    <button id="backButton">PREVIOUS</button>
+    <input type="file" id="folderInput" multiple webkitdirectory directory>
+    <input type="file" id="audioInput" accept="audio/*" multiple>
+  </div>
+  <audio id="player" preload="metadata" playsinline></audio>
+
+  <script src="./turing-audio-reservoir.js"></script>
+  <script>
+    /* ========= Visible Gray-Scott — original visual target ========= */
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const size = 500;
+    canvas.width = canvas.height = size;
+    const imageData = ctx.createImageData(size, size);
+    let canvasActivated = false;
+
+    let U = new Float32Array(size * size).fill(1);
+    let V = new Float32Array(size * size).fill(0);
+    let U2 = new Float32Array(size * size);
+    let V2 = new Float32Array(size * size);
+
+    function resetRD(){
+      U.fill(1); V.fill(0);
+      for (let y = size / 2 - 16; y < size / 2 + 16; y++)
+        for (let x = size / 2 - 16; x < size / 2 + 16; x++)
+          V[y * size + x] = 1;
+    }
+    resetRD();
+
+    const du = 0.16, dv = 0.08;
+    let flashFeed = 0, flashKill = 0;
+    const pink = Array(8).fill(0);
+
+    // Hidden 96x96 Turing Reservoir from today's experiments.
+    // It receives audio; the visible 500x500 field never receives raw EQ values directly.
+    const audioReservoir = new TuringAudioReservoir({
+      n:96, du:0.16, dv:0.08, feed:0.060, kill:0.062,
+      injectRadius:2, injectV:0.13, injectU:0.065, seed:41071
+    });
+    let reservoirOut = {low:.5,mid:.5,high:.5,onset:.5,motion:.5,meanV:.5,stdV:.5,x:.5,y:.5};
+
+    const audioState = {
+      low:0, mid:0, high:0, energy:0, onset:0,
+      prevLow:0, prevEnergy:0,
+      onsetMean:0.018, onsetVar:0.0004,
+      beat:false
+    };
+    let audioCtx = null, mediaSrc = null, analyser = null;
+    let freqData = null, prevFreq = null, timeData = null;
+    let lastReservoirTick = 0;
+    let lastBeatAt = -1e9;
+    let lastSoftNudge = -1e9;
+    let beatPulse = 0;
+
+    function pinkNoise() {
+      let total = 0;
+      for (let i = 0; i < pink.length; i++) {
+        if (Math.random() < 1 / (1 << i)) pink[i] = Math.random() * 2 - 1;
+        total += pink[i];
+      }
+      return total / pink.length;
+    }
+
+    function lap(f, x, y) {
+      return f[((y - 1 + size) % size) * size + x] + f[((y + 1) % size) * size + x] +
+             f[y * size + ((x - 1 + size) % size)] + f[y * size + ((x + 1) % size)] - 4 * f[y * size + x];
+    }
+
+    function step() {
+      const t = performance.now() / 1000;
+      // Keep the original visual regime. Reservoir output only nudges it.
+      // This range is deliberately close to the original pink/sine drift.
+      const rLow = reservoirOut.low - .5;
+      const rMid = reservoirOut.mid - .5;
+      const rHigh = reservoirOut.high - .5;
+      const rMotion = reservoirOut.motion - .5;
+      const musicF = rLow * 0.00085 - rMid * 0.00024 + rMotion * 0.00024 + beatPulse * 0.00028;
+      const musicK = rHigh * 0.00072 + rMid * 0.00022 - rLow * 0.00015 - beatPulse * 0.00022;
+      const f = 0.022 + pinkNoise() * 0.0015 + 0.0007 * Math.sin(t * Math.PI / 10) + flashFeed + musicF;
+      const k = 0.051 + pinkNoise() * 0.0015 + 0.0007 * Math.cos(t * Math.PI / 10) + flashKill + musicK;
+      flashFeed *= 0.85; flashKill *= 0.85;
+
+      for (let i = 0; i < U.length; i++) {
+        const y = Math.floor(i / size), x = i % size;
+        const u = U[i], v = V[i];
+        const Lu = lap(U, x, y) * 1.2;
+        const Lv = lap(V, x, y) * 1.2;
+        U2[i] = u + (du * Lu - u * v * v + f * (1 - u));
+        V2[i] = v + (dv * Lv + u * v * v - (f + k) * v);
+      }
+      const tu = U; U = U2; U2 = tu;
+      const tv = V; V = V2; V2 = tv;
+    }
+
+    function microNudgeOne(cx, cy, radius, amount){
+      const r = Math.max(2, Math.round(radius));
+      const r2 = r*r;
+      for(let oy=-r; oy<=r; oy++){
+        const yy = (cy + oy + size) % size;
+        for(let ox=-r; ox<=r; ox++){
+          const d2 = ox*ox + oy*oy;
+          if(d2 > r2) continue;
+          const xx = (cx + ox + size) % size;
+          const falloff = 1 - Math.sqrt(d2)/(r+0.001);
+          const a = amount * falloff;
+          const idx = yy*size + xx;
+          V[idx] = Math.min(1, V[idx] + a * (1 - V[idx]));
+          U[idx] = Math.max(0, U[idx] - a * 0.22);
+        }
+      }
+    }
+
+    // Keep every spatial audio response symmetric around both canvas axes.
+    // The reservoir may choose any point, but the visible Gray-Scott field receives
+    // the same perturbation at all four mirror positions.
+    function microNudge(x, y, radius, amount){
+      const cx = Math.max(0, Math.min(size-1, Math.round(x)));
+      const cy = Math.max(0, Math.min(size-1, Math.round(y)));
+      const points = [
+        [cx, cy],
+        [size-1-cx, cy],
+        [cx, size-1-cy],
+        [size-1-cx, size-1-cy]
+      ];
+      const seen = new Set();
+      for(const [px,py] of points){
+        const key = `${px},${py}`;
+        if(seen.has(key)) continue;
+        seen.add(key);
+        microNudgeOne(px,py,radius,amount);
+      }
+    }
+
+    function draw() {
+      const d = imageData.data;
+      const kTone = 3.0;
+      const norm = x => Math.max(0, Math.min(1, x));
+      const tone = x => (1 - Math.exp(-kTone * x)) / (1 - Math.exp(-kTone));
+      for (let i = 0; i < U.length; i++) {
+        const base = norm((U[i] - V[i]) * 1.0);
+        const t = tone(base);
+        const capped = Math.min(t, 0.92);
+        const c = (capped * 255) | 0;
+        const p = i * 4;
+        d[p] = d[p + 1] = d[p + 2] = c; d[p + 3] = 255;
+      }
+      ctx.putImageData(imageData, 0, 0);
+    }
+
+    function bandEnergy(loHz, hiHz){
+      if(!analyser || !freqData || !audioCtx) return 0;
+      const nyquist = audioCtx.sampleRate / 2;
+      const lo = Math.max(0, Math.floor(loHz / nyquist * freqData.length));
+      const hi = Math.min(freqData.length-1, Math.ceil(hiHz / nyquist * freqData.length));
+      if(hi <= lo) return 0;
+      let sum = 0;
+      for(let i=lo;i<=hi;i++){ const v=freqData[i]/255; sum += v*v; }
+      return Math.sqrt(sum / (hi-lo+1));
+    }
+
+    function clamp01(x){ return Math.max(0,Math.min(1,x)); }
+
+    function updateAudioFeatures(now){
+      audioState.beat = false;
+      if(!analyser || player.paused){
+        audioState.low *= .94; audioState.mid *= .94; audioState.high *= .94;
+        audioState.energy *= .94; audioState.onset *= .80;
+        beatPulse *= .90;
+        return;
+      }
+
+      analyser.getByteFrequencyData(freqData);
+      analyser.getByteTimeDomainData(timeData);
+
+      const low = bandEnergy(30,180);
+      const mid = bandEnergy(180,2500);
+      const high = bandEnergy(2500,12000);
+      let sq=0;
+      for(let i=0;i<timeData.length;i++){
+        const s=(timeData[i]-128)/128; sq+=s*s;
+      }
+      const energy=Math.sqrt(sq/timeData.length);
+
+      // Spectral flux makes percussion/transients visible, not just loudness.
+      let flux=0, fluxN=0;
+      for(let i=2;i<freqData.length;i++){
+        const cur=freqData[i]/255, prev=prevFreq[i]/255;
+        const d=cur-prev;
+        if(d>0) flux+=d;
+        prevFreq[i]=freqData[i];
+        fluxN++;
+      }
+      flux = fluxN ? flux/fluxN : 0;
+      const lowRise=Math.max(0,low-audioState.prevLow);
+      const energyRise=Math.max(0,energy-audioState.prevEnergy);
+      const rawOnset=flux*2.9 + lowRise*1.8 + energyRise*1.4;
+
+      // Adaptive onset threshold: works across quiet and loud tracks.
+      const sd=Math.sqrt(Math.max(1e-6,audioState.onsetVar));
+      const threshold=audioState.onsetMean + sd*1.25;
+      const beat = rawOnset>threshold && energy>0.018 && (now-lastBeatAt)>135;
+      const dOn=rawOnset-audioState.onsetMean;
+      audioState.onsetMean += dOn*0.018;
+      audioState.onsetVar += (dOn*dOn-audioState.onsetVar)*0.028;
+
+      audioState.prevLow=low; audioState.prevEnergy=energy;
+      audioState.low=low; audioState.mid=mid; audioState.high=high; audioState.energy=energy;
+      audioState.onset=clamp01(rawOnset*5.0 + (beat?0.55:0));
+      audioState.beat=beat;
+      if(beat){ lastBeatAt=now; beatPulse=1; }
+      else beatPulse*=.90;
+    }
+
+    function tickReservoir(now){
+      if(!analyser || player.paused) return;
+      if(now-lastReservoirTick<50) return; // ~20 Hz hidden temporal processor
+      lastReservoirTick=now;
+      reservoirOut = audioReservoir.process({
+        low:clamp01(audioState.low*1.65),
+        mid:clamp01(audioState.mid*1.40),
+        high:clamp01(audioState.high*1.55),
+        onset:audioState.onset
+      },4);
+    }
+
+    function reactVisiblePattern(now){
+      if(player.paused || !analyser) return;
+
+      // Beat: a small, spatially reservoir-selected perturbation + short speed pulse.
+      if(audioState.beat){
+        const x=size*(0.08+0.84*reservoirOut.x);
+        const y=size*(0.08+0.84*reservoirOut.y);
+        const radius=2.4 + audioState.low*3.0 + reservoirOut.low*0.8;
+        const amount=0.030 + audioState.onset*0.035 + audioState.low*0.018;
+        microNudge(x,y,radius,amount);
+        flashFeed += 0.00055 + audioState.low*0.00032;
+        flashKill -= 0.00028 + audioState.onset*0.00018;
+        lastSoftNudge=now;
+        return;
+      }
+
+      // Beatless/ambient music still moves, but only when the hidden reservoir itself
+      // is changing. This replaces the clock-driven nudge from V2.1.
+      const reservoirChanged = reservoirOut.motion > 0.61 || reservoirOut.stdV > 0.64;
+      if(audioState.energy>0.025 && reservoirChanged && now-lastSoftNudge>850){
+        const x=size*(0.10+0.80*reservoirOut.x);
+        const y=size*(0.10+0.80*reservoirOut.y);
+        microNudge(x,y,2.2+reservoirOut.mid*0.9,0.014+audioState.energy*0.020);
+        lastSoftNudge=now;
+      }
+    }
+
+    function loop(now){
+      updateAudioFeatures(now);
+      tickReservoir(now);
+      reactVisiblePattern(now);
+      const extra = beatPulse>.58 ? 2 : (beatPulse>.20 ? 1 : 0);
+      for(let i=0;i<3+extra;i++) step();
+      draw();
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+
+    canvas.addEventListener('click', () => { flashFeed = 0.02; flashKill = -0.01; });
+
+    /* ========= Audio / playlist ========= */
+    const player = document.getElementById('player');
+
+    function ensureGraph(){
+      if (audioCtx) return;
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      mediaSrc = audioCtx.createMediaElementSource(player);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.48; // keep transients; reservoir handles memory
+      freqData = new Uint8Array(analyser.frequencyBinCount);
+      prevFreq = new Uint8Array(analyser.frequencyBinCount);
+      timeData = new Uint8Array(analyser.fftSize);
+      mediaSrc.connect(analyser);
+      analyser.connect(audioCtx.destination);
+    }
+
+    let playlist = [], urls = [], current = 0;
+    let wantsPlayback = false;
+    let switchingTrack = false;
+    let resumePending = false;
+    const lcdSpan = document.querySelector('#lcd span');
+    const lcd = t => (lcdSpan.textContent = t);
+    const nowText = () => playlist.length ? `TRACK ${current+1}/${playlist.length}: ${playlist[current].name}` : 'NO FILES';
+
+    function sortNumeric(files){
+      return files.sort((a,b)=>{
+        const ra=a.name.match(/\d+/), rb=b.name.match(/\d+/);
+        if(ra&&rb){ const na=+ra[0], nb=+rb[0]; if(na!==nb) return na-nb; }
+        else if(ra&&!rb) return -1; else if(!ra&&rb) return 1;
+        return a.name.localeCompare(b.name,'ja',{numeric:true,sensitivity:'base'});
+      });
+    }
+    function revokeAll(){ urls.forEach(u=>URL.revokeObjectURL(u)); urls=[]; }
+    async function replacePlaylist(files,label=''){
+      wantsPlayback = false;
+      resumePending = false;
+      switchingTrack = true;
+      try{ player.pause(); }catch{}
+      switchingTrack = false;
+      revokeAll();
+      playlist = sortNumeric(files.filter(f => (f.type && f.type.startsWith('audio/')) || /\.(mp3|m4a|aac|wav|flac|ogg)$/i.test(f.name)));
+      urls = playlist.map(f=>URL.createObjectURL(f));
+      current = 0; player.src = '';
+      lcd(playlist.length ? `LOADED ${playlist.length} files${label?' — '+label:''}` : 'NO FILES');
+      updateMediaSessionMetadata();
+    }
+
+    async function play(index=current){
+      if(!playlist.length) return;
+      wantsPlayback = true;
+      resumePending = false;
+      current = Math.max(0, Math.min(index, playlist.length-1));
+      ensureGraph();
+      if(player.src !== urls[current]) {
+        switchingTrack = true;
+        player.src = urls[current];
+        switchingTrack = false;
+        audioReservoir.reset();
+        reservoirOut = {low:.5,mid:.5,high:.5,onset:.5,motion:.5,meanV:.5,stdV:.5,x:.5,y:.5};
+        audioState.prevLow=0; audioState.prevEnergy=0;
+        audioState.onsetMean=0.018; audioState.onsetVar=0.0004;
+        if(prevFreq) prevFreq.fill(0);
+      }
+      try {
+        if(audioCtx?.state==='suspended') await audioCtx.resume();
+        await player.play();
+        lcd(nowText());
+        if (!canvasActivated){ canvas.classList.add('active'); canvasActivated = true; }
+        await requestWakeLock();
+        updateMediaSessionMetadata();
+        if('mediaSession' in navigator) navigator.mediaSession.playbackState='playing';
+      } catch(e) {
+        resumePending = true;
+        console.warn('play() blocked:', e);
+      }
+    }
+
+    function pauseManual(){
+      wantsPlayback = false;
+      resumePending = false;
+      try{ player.pause(); }catch{}
+      if('mediaSession' in navigator) navigator.mediaSession.playbackState='paused';
+      lcd(playlist.length?`PAUSED — ${nowText()}`:'PAUSED');
+    }
+
+    async function resumeAfterInterruption(){
+      if(!wantsPlayback || !playlist.length || !player.paused) return;
+      try{
+        ensureGraph();
+        if(audioCtx?.state==='suspended') await audioCtx.resume();
+        await player.play();
+        resumePending = false;
+        lcd(nowText());
+        await requestWakeLock();
+        if('mediaSession' in navigator) navigator.mediaSession.playbackState='playing';
+      }catch(e){
+        // Some iOS/browser interruption paths require a fresh user gesture.
+        // Keep the playback intent so the next tap can resume without losing the track.
+        resumePending = true;
+        lcd(`TAP PLAY TO RESUME — ${nowText()}`);
+      }
+    }
+
+    player.addEventListener('play',()=>{
+      resumePending = false;
+      if('mediaSession' in navigator) navigator.mediaSession.playbackState='playing';
+    });
+    player.addEventListener('pause',()=>{
+      if('mediaSession' in navigator) navigator.mediaSession.playbackState='paused';
+      if(wantsPlayback && !switchingTrack && !player.ended) resumePending = true;
+    });
+    player.addEventListener('ended', ()=>{
+      if(!playlist.length) return;
+      play((current+1)%playlist.length);
+    });
+
+    document.getElementById('playButton').addEventListener('click', ()=> play(current));
+    document.getElementById('pauseButton').addEventListener('click', pauseManual);
+    document.getElementById('skipButton').addEventListener('click', ()=> play((current+1)%playlist.length));
+    document.getElementById('backButton').addEventListener('click', ()=> play((current-1+playlist.length)%playlist.length));
+
+    /* ========= Folder / file selection ========= */
+    const folderButton = document.getElementById('folderButton');
+    const folderInput = document.getElementById('folderInput');
+    const audioInput = document.getElementById('audioInput');
+
+    function isIOSLike(){
+      return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+        (navigator.platform==='MacIntel' && navigator.maxTouchPoints>1);
+    }
+    async function* walk(h){
+      for await (const [,e] of h.entries()){
+        if(e.kind==='file') yield await e.getFile();
+        else if(e.kind==='directory') yield* walk(e);
+      }
+    }
+    async function pickFolderNative(){
+      const h=await window.showDirectoryPicker({mode:'read'});
+      const files=[]; for await(const f of walk(h)) files.push(f);
+      await replacePlaylist(files,h?.name||'');
+    }
+    folderButton.addEventListener('click', async e=>{
+      e.preventDefault();
+      if(isIOSLike()){ audioInput.click(); return; }
+      if('showDirectoryPicker' in window){
+        try{ await pickFolderNative(); return; }catch(err){ if(err?.name==='AbortError') return; }
+      }
+      folderInput.click();
+    });
+    folderInput.addEventListener('change',async e=>{
+      const files=[...(e.target.files||[])];
+      const label=files[0]?.webkitRelativePath?.split('/')[0]||'';
+      await replacePlaylist(files,label); e.target.value='';
+    });
+    audioInput.addEventListener('change',async e=>{
+      await replacePlaylist([...(e.target.files||[])]); e.target.value='';
+    });
+
+    /* ========= Wake Lock / mobile interruption recovery ========= */
+    let wakeLock = null, wakeRetryTimer = null;
+    async function requestWakeLock(){
+      try{
+        if(!('wakeLock' in navigator)) return;
+        if(document.visibilityState!=='visible') return;
+        if(!wantsPlayback && player.paused) return;
+        if(wakeLock) return;
+        wakeLock = await navigator.wakeLock.request('screen');
+        if(!document.querySelector('#lcd small')) lcdSpan.insertAdjacentHTML('beforeend',' <small>• screen on</small>');
+        wakeLock.addEventListener('release',()=>{
+          wakeLock = null;
+          clearTimeout(wakeRetryTimer);
+          if(document.visibilityState==='visible' && wantsPlayback){
+            wakeRetryTimer = setTimeout(()=>{ requestWakeLock(); },500);
+          }
+        });
+      }catch(e){
+        clearTimeout(wakeRetryTimer);
+        if(document.visibilityState==='visible' && wantsPlayback){
+          wakeRetryTimer = setTimeout(()=>{ requestWakeLock(); },1000);
+        }
+      }
+    }
+
+    async function recoverMobilePlayback(){
+      if(document.visibilityState!=='visible') return;
+      if(wantsPlayback){
+        await requestWakeLock();
+        if(player.paused || resumePending) await resumeAfterInterruption();
+        else if(audioCtx?.state==='suspended') audioCtx.resume().catch(()=>{});
+      }
+    }
+
+    document.addEventListener('visibilitychange',()=>{
+      if(document.visibilityState==='visible') recoverMobilePlayback();
+    });
+    window.addEventListener('focus', recoverMobilePlayback);
+    window.addEventListener('pageshow', recoverMobilePlayback);
+
+    // Re-acquire wake lock / audio context from a real gesture after iOS or call interruptions.
+    ['pointerdown','touchstart'].forEach(ev=>document.addEventListener(ev,()=>{
+      if(audioCtx?.state==='suspended') audioCtx.resume().catch(()=>{});
+      if(wantsPlayback) requestWakeLock();
+      if(wantsPlayback && (player.paused || resumePending)) resumeAfterInterruption();
+    }, {passive:true}));
+
+    /* ========= Media Session ========= */
+    function updateMediaSessionMetadata(){
+      if (!('mediaSession' in navigator)) return;
+      const name = playlist[current]?.name || '—';
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: name,
+        artist: 'GS-Visualizer',
+        album: 'Turing Audio Reservoir',
+        artwork: [
+          { src: './icon-192.png', sizes: '192x192', type: 'image/png' },
+          { src: './icon-512.png', sizes: '512x512', type: 'image/png' }
+        ]
+      });
+    }
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.setActionHandler('play', () => play(current));
+      navigator.mediaSession.setActionHandler('pause', () => pauseManual());
+      navigator.mediaSession.setActionHandler('previoustrack', () => play((current - 1 + playlist.length) % playlist.length));
+      navigator.mediaSession.setActionHandler('nexttrack', () => play((current + 1) % playlist.length));
+    }
+
+    if ('serviceWorker' in navigator) {
+      addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(()=>{}));
+    }
+  </script>
+</body>
+</html>
