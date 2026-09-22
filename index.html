@@ -58,9 +58,20 @@
 
     function resetRD(){
       U.fill(1); V.fill(0);
-      for (let y = size / 2 - 16; y < size / 2 + 16; y++)
-        for (let x = size / 2 - 16; x < size / 2 + 16; x++)
-          V[y * size + x] = 1;
+      const seeds = [
+        [Math.round(size * 0.31), Math.round(size * 0.31)],
+        [Math.round(size * 0.69) - 1, Math.round(size * 0.31)],
+        [Math.round(size * 0.31), Math.round(size * 0.69) - 1],
+        [Math.round(size * 0.69) - 1, Math.round(size * 0.69) - 1]
+      ];
+      const r = 10;
+      for (const [cx, cy] of seeds) {
+        for (let y = cy - r; y <= cy + r; y++) {
+          for (let x = cx - r; x <= cx + r; x++) {
+            if ((x-cx)*(x-cx) + (y-cy)*(y-cy) <= r*r) V[y * size + x] = 1;
+          }
+        }
+      }
     }
     resetRD();
 
@@ -113,8 +124,8 @@
       const rMotion = reservoirOut.motion - .5;
       const musicF = rLow * 0.00085 - rMid * 0.00024 + rMotion * 0.00024 + beatPulse * 0.00028;
       const musicK = rHigh * 0.00072 + rMid * 0.00022 - rLow * 0.00015 - beatPulse * 0.00022;
-      const f = 0.022 + pinkNoise() * 0.0015 + 0.0007 * Math.sin(t * Math.PI / 10) + flashFeed + musicF;
-      const k = 0.051 + pinkNoise() * 0.0015 + 0.0007 * Math.cos(t * Math.PI / 10) + flashKill + musicK;
+      const f = 0.022 + pinkNoise() * 0.00055 + 0.00045 * Math.sin(t * Math.PI / 10) + flashFeed + musicF;
+      const k = 0.051 + pinkNoise() * 0.00055 + 0.00045 * Math.cos(t * Math.PI / 10) + flashKill + musicK;
       flashFeed *= 0.85; flashKill *= 0.85;
 
       for (let i = 0; i < U.length; i++) {
@@ -217,6 +228,10 @@
 
     function clamp01(x){ return Math.max(0,Math.min(1,x)); }
 
+    function beautyCoord(v){
+      return size * (0.12 + 0.26 * clamp01(v));
+    }
+
     function updateAudioFeatures(now){
       audioState.beat = false;
       if(!analyser || player.paused){
@@ -285,13 +300,13 @@
 
       // Beat: a small, spatially reservoir-selected perturbation + short speed pulse.
       if(audioState.beat){
-        const x=size*(0.08+0.84*reservoirOut.x);
-        const y=size*(0.08+0.84*reservoirOut.y);
-        const radius=2.4 + audioState.low*3.0 + reservoirOut.low*0.8;
-        const amount=0.030 + audioState.onset*0.035 + audioState.low*0.018;
+        const x=beautyCoord(reservoirOut.x);
+        const y=beautyCoord(reservoirOut.y);
+        const radius=1.8 + audioState.low*2.0 + reservoirOut.low*0.5;
+        const amount=0.022 + audioState.onset*0.026 + audioState.low*0.012;
         microNudge(x,y,radius,amount);
-        flashFeed += 0.00055 + audioState.low*0.00032;
-        flashKill -= 0.00028 + audioState.onset*0.00018;
+        flashFeed += 0.00038 + audioState.low*0.00022;
+        flashKill -= 0.00019 + audioState.onset*0.00012;
         lastSoftNudge=now;
         return;
       }
@@ -300,9 +315,9 @@
       // is changing. This replaces the clock-driven nudge from V2.1.
       const reservoirChanged = reservoirOut.motion > 0.61 || reservoirOut.stdV > 0.64;
       if(audioState.energy>0.025 && reservoirChanged && now-lastSoftNudge>850){
-        const x=size*(0.10+0.80*reservoirOut.x);
-        const y=size*(0.10+0.80*reservoirOut.y);
-        microNudge(x,y,2.2+reservoirOut.mid*0.9,0.014+audioState.energy*0.020);
+        const x=beautyCoord(reservoirOut.x);
+        const y=beautyCoord(reservoirOut.y);
+        microNudge(x,y,1.8+reservoirOut.mid*0.6,0.010+audioState.energy*0.014);
         lastSoftNudge=now;
       }
     }
