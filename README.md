@@ -70,6 +70,12 @@ F / K modulation + symmetric local perturbation
 
 ---
 
+## スクリーンショット
+
+![GS-Visualizer Screenshot](./screenshot.png)
+
+---
+
 ## デモページ
 
 https://masato-nasu.github.io/GS-Visualizer/
