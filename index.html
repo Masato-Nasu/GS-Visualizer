@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no" />
-  <title>GS-Visualizer V2.2.1 — Turing Audio Reservoir</title>
+  <title>GS-Visualizer V2.2.2 — Turing Audio Reservoir</title>
   <link rel="manifest" href="./manifest.json">
   <link rel="icon" href="./icon-192.png" type="image/png">
   <meta name="theme-color" content="#000000">
@@ -168,6 +168,26 @@
       }
     }
 
+    function enforceMirrorSymmetry() {
+      const half = size / 2;
+      for (let y = 0; y < half; y++) {
+        const my = size - 1 - y;
+        for (let x = 0; x < half; x++) {
+          const mx = size - 1 - x;
+          const i1 = y * size + x;
+          const i2 = y * size + mx;
+          const i3 = my * size + x;
+          const i4 = my * size + mx;
+
+          const u = (U[i1] + U[i2] + U[i3] + U[i4]) * 0.25;
+          const v = (V[i1] + V[i2] + V[i3] + V[i4]) * 0.25;
+
+          U[i1] = U[i2] = U[i3] = U[i4] = u;
+          V[i1] = V[i2] = V[i3] = V[i4] = v;
+        }
+      }
+    }
+
     function draw() {
       const d = imageData.data;
       const kTone = 3.0;
@@ -293,6 +313,7 @@
       reactVisiblePattern(now);
       const extra = beatPulse>.58 ? 2 : (beatPulse>.20 ? 1 : 0);
       for(let i=0;i<3+extra;i++) step();
+      enforceMirrorSymmetry();
       draw();
       requestAnimationFrame(loop);
     }
